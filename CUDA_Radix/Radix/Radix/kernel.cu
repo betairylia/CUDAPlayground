@@ -8,6 +8,13 @@
 #include <ctime>
 #include <algorithm>
 
+/*
+TODOs
+
+Wrong result when size != 2^n
+Cannot handle (wrong result) when size is huge
+*/
+
 using namespace std;
 
 static void HandleError(cudaError_t err,
@@ -99,7 +106,7 @@ int output[arraySize] = { 0 };
 
 int main()
 {
-	const int totalBits = 30, numBits = 2;
+	const int totalBits = 22, numBits = 2;
 	const int numBitsPow2 = pow(2, numBits);
 
 	int sizeBitScan = numBitsPow2 * gridCount;
