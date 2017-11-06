@@ -29,9 +29,13 @@ static void HandleError(cudaError_t err,
 }
 #define HANDLE_ERROR( err ) (HandleError( err, __FILE__, __LINE__ ))
 
+//#define CHECK_RESULTS_OUTPUT
+
 __global__ void GenerateHistogramAndPredicate(int *input, int *currentBit, int *numBits, int *bitHistogram, int *predicate, int *size)
 {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
+	int bid = blockIdx.x;
+
 	if (id >= (*size))
 	{
 		return;
@@ -75,6 +79,63 @@ __global__ void PrefixSum(int *input, int *output, int *size, int *totalBits)
 	}
 }
 
+__global__ void PrefixSum_GPUGems(int *g_odata, int *g_idata, int totalSize, int n, int numBitPow2)
+{
+	extern __shared__ int temp[];  // allocated on invocation
+
+	int thid = threadIdx.x;
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	bool isEnd = ((2 * id + 1) >= totalSize);
+
+	if (2 * id >= totalSize || 2 * thid >= n)
+	{
+		return;
+	}
+
+	for (int startOffset = 0; startOffset < numBitPow2; startOffset++)
+	{
+		int offset = 1;
+		temp[2 * thid] = g_idata[startOffset * totalSize + 2 * id]; // load input into shared memory
+		temp[2 * thid + 1] = isEnd ? 0 : g_idata[startOffset * totalSize + 2 * id + 1];
+
+		for (int d = n >> 1; d > 0; d >>= 1) // build sum in place up the tree
+		{
+			__syncthreads();
+			if (thid < d)
+			{
+				int ai = offset*(2 * thid + 1) - 1;
+				int bi = offset*(2 * thid + 2) - 1;
+
+				temp[bi] += temp[ai];
+			}
+			offset *= 2;
+		}
+
+		if (thid == 0) { temp[n - 1] = 0; } // clear the last element
+
+		for (int d = 1; d < n; d *= 2) // traverse down tree & build scan
+		{
+			offset >>= 1;
+			__syncthreads();
+			if (thid < d)
+			{
+				int ai = offset*(2 * thid + 1) - 1;
+				int bi = offset*(2 * thid + 2) - 1;
+
+				int t = temp[ai];
+				temp[ai] = temp[bi];
+				temp[bi] += t;
+			}
+		}
+		__syncthreads();
+
+		g_odata[startOffset * totalSize + 2 * id] = temp[2 * thid]; // write results to device memory
+
+		if (!isEnd)
+			g_odata[startOffset * totalSize + 2 * id + 1] = temp[2 * thid + 1];
+	}
+}
+
 __global__ void ReOrder(int *input, int *output, int *bitScan, int *relativePos, int *currentBit, int *numBits, int *size)
 {
 	int id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -99,14 +160,14 @@ int pow(int a, int b)
 	return result;
 }
 
-const int arraySize = 262144, gridSize = 1024;
-const int gridCount = arraySize / gridSize;
+const int arraySize = 500000, gridSize = 1024;
+const int gridCount = ceil((float)arraySize / (float)gridSize);
 int input[arraySize] = { 0 };
 int output[arraySize] = { 0 };
 
 int main()
 {
-	const int totalBits = 22, numBits = 2;
+	const int totalBits = 24, numBits = 1;
 	const int numBitsPow2 = pow(2, numBits);
 
 	int sizeBitScan = numBitsPow2 * gridCount;
@@ -180,97 +241,105 @@ int main()
 		HANDLE_ERROR(cudaMemset(d_predicate, 0, numBitsPow2 * arraySize * sizeof(int)));
 		HANDLE_ERROR(cudaMemset(d_relativePos, 0, numBitsPow2 * arraySize * sizeof(int)));
 
-		////check results
-		//HANDLE_ERROR(cudaMemcpy(output, d_Input, arraySize * sizeof(int), cudaMemcpyDeviceToHost));
-		//printf("Input:\t");
-		//for (int i = 0; i < arraySize; i++)
-		//{
-		//	printf("%d ", output[i]);
-		//}
-		//printf("\n");
-
+#ifdef CHECK_RESULTS_OUTPUT
+		//check results
+		HANDLE_ERROR(cudaMemcpy(output, d_Input, arraySize * sizeof(int), cudaMemcpyDeviceToHost));
+		printf("Input:\t");
+		for (int i = 0; i < arraySize; i++)
+		{
+			printf("%d ", output[i]);
+		}
+		printf("\n");
+#endif
 		/////////////////
 
 		GenerateHistogramAndPredicate <<< gridCount, gridSize >>> (d_Input, d_currentBit, d_bitLenth, d_bitHistogram, d_predicate, d_size);
 
-		////check results
-		//HANDLE_ERROR(cudaDeviceSynchronize());
-		//HANDLE_ERROR(cudaMemcpy(tmp_bitHistogram, d_bitHistogram, numBitsPow2 * gridCount * sizeof(int), cudaMemcpyDeviceToHost));
-		//printf("Bit  %d:\t", i);
-		//for (int j = 0; j < gridCount; j++)
-		//{
-		//	for (int k = 0; k < numBitsPow2; k++)
-		//	{
-		//		printf("%d ", tmp_bitHistogram[j * numBitsPow2 + k]);
-		//	}
-		//	printf("| ");
-		//}
-		//printf("\n");
-
+#ifdef CHECK_RESULTS_OUTPUT
+		//check results
+		HANDLE_ERROR(cudaDeviceSynchronize());
+		HANDLE_ERROR(cudaMemcpy(tmp_bitHistogram, d_bitHistogram, numBitsPow2 * gridCount * sizeof(int), cudaMemcpyDeviceToHost));
+		printf("Bit  %d:\t", i);
+		for (int j = 0; j < gridCount; j++)
+		{
+			for (int k = 0; k < numBitsPow2; k++)
+			{
+				printf("%d ", tmp_bitHistogram[j * numBitsPow2 + k]);
+			}
+			printf("| ");
+		}
+		printf("\n");
+#endif
 		/////////////////
 
 		PrefixSum <<< 1, numBitsPow2 * gridCount >>> (d_bitHistogram, d_bitScan, d_sizeBitScan, d_one);
 
-		////check results
-		//HANDLE_ERROR(cudaDeviceSynchronize());
-		//HANDLE_ERROR(cudaMemcpy(tmp_bitHistogram, d_bitScan, numBitsPow2 * gridCount * sizeof(int), cudaMemcpyDeviceToHost));
-		//printf("Scan %d:\t", i);
-		//for (int j = 0; j < gridCount; j++)
-		//{
-		//	for (int k = 0; k < numBitsPow2; k++)
-		//	{
-		//		printf("%d ", tmp_bitHistogram[j * numBitsPow2 + k]);
-		//	}
-		//	printf("| ");
-		//}
-		//printf("\n");
-
+#ifdef CHECK_RESULTS_OUTPUT
+		//check results
+		HANDLE_ERROR(cudaDeviceSynchronize());
+		HANDLE_ERROR(cudaMemcpy(tmp_bitHistogram, d_bitScan, numBitsPow2 * gridCount * sizeof(int), cudaMemcpyDeviceToHost));
+		printf("Scan %d:\t", i);
+		for (int j = 0; j < gridCount; j++)
+		{
+			for (int k = 0; k < numBitsPow2; k++)
+			{
+				printf("%d ", tmp_bitHistogram[j * numBitsPow2 + k]);
+			}
+			printf("| ");
+		}
+		printf("\n");
+#endif
 		/////////////////
 
-		////check results
-		//HANDLE_ERROR(cudaMemcpy(tmp_bitHistogram, d_predicate, numBitsPow2 * arraySize * sizeof(int), cudaMemcpyDeviceToHost));
-		//printf("Pred %d:\t", i);
-		//for (int j = 0; j < numBitsPow2; j++)
-		//{
-		//	for (int k = 0; k < arraySize; k++)
-		//	{
-		//		printf("%d ", tmp_bitHistogram[j * arraySize + k]);
-		//	}
-		//	printf("| ");
-		//}
-		//printf("\n");
-
+#ifdef CHECK_RESULTS_OUTPUT
+		//check results
+		HANDLE_ERROR(cudaMemcpy(tmp_bitHistogram, d_predicate, numBitsPow2 * arraySize * sizeof(int), cudaMemcpyDeviceToHost));
+		printf("Pred %d:\t", i);
+		for (int j = 0; j < numBitsPow2; j++)
+		{
+			for (int k = 0; k < arraySize; k++)
+			{
+				printf("%d ", tmp_bitHistogram[j * arraySize + k]);
+			}
+			printf("| ");
+		}
+		printf("\n");
+#endif
 		/////////////////
 
-		PrefixSum <<< gridCount, gridSize >>> (d_predicate, d_relativePos, d_size, d_bitLenthPow2);
+		//PrefixSum <<< gridCount, gridSize >>> (d_relativePos, d_predicate, d_size, d_bitLenthPow2);
+		PrefixSum_GPUGems <<< gridCount, gridSize / 2, gridSize * sizeof(int) >>> (d_relativePos, d_predicate, arraySize, gridSize, numBitsPow2);
 
-		////check results
-		//HANDLE_ERROR(cudaDeviceSynchronize());
-		//HANDLE_ERROR(cudaMemcpy(tmp_bitHistogram, d_relativePos, numBitsPow2 * arraySize * sizeof(int), cudaMemcpyDeviceToHost));
-		//printf("RPos %d:\t", i);
-		//for (int j = 0; j < numBitsPow2; j++)
-		//{
-		//	for (int k = 0; k < arraySize; k++)
-		//	{
-		//		printf("%d ", tmp_bitHistogram[j * arraySize + k]);
-		//	}
-		//	printf("| ");
-		//}
-		//printf("\n");
-
+#ifdef CHECK_RESULTS_OUTPUT
+		//check results
+		HANDLE_ERROR(cudaDeviceSynchronize());
+		HANDLE_ERROR(cudaMemcpy(tmp_bitHistogram, d_relativePos, numBitsPow2 * arraySize * sizeof(int), cudaMemcpyDeviceToHost));
+		printf("RPos %d:\t", i);
+		for (int j = 0; j < numBitsPow2; j++)
+		{
+			for (int k = 0; k < arraySize; k++)
+			{
+				printf("%d ", tmp_bitHistogram[j * arraySize + k]);
+			}
+			printf("| ");
+		}
+		printf("\n");
+#endif
 		/////////////////
 
 		ReOrder <<< gridCount, gridSize >>> (d_Input, d_Output, d_bitScan, d_relativePos, d_currentBit, d_bitLenth, d_size);
 
-		////check results
-		//HANDLE_ERROR(cudaDeviceSynchronize());
-		//HANDLE_ERROR(cudaMemcpy(output, d_Output, arraySize * sizeof(int), cudaMemcpyDeviceToHost));
-		//printf("Output:\t");
-		//for (int i = 0; i < arraySize; i++)
-		//{
-		//	printf("%d ", output[i]);
-		//}
-		//printf("\n");
+#ifdef CHECK_RESULTS_OUTPUT
+		//check results
+		HANDLE_ERROR(cudaDeviceSynchronize());
+		HANDLE_ERROR(cudaMemcpy(output, d_Output, arraySize * sizeof(int), cudaMemcpyDeviceToHost));
+		printf("Output:\t");
+		for (int i = 0; i < arraySize; i++)
+		{
+			printf("%d ", output[i]);
+		}
+		printf("\n*--*--*--*--*--*\n");
+#endif
 		HANDLE_ERROR(cudaDeviceSynchronize());
 
 		/////////////////
@@ -292,13 +361,24 @@ int main()
 	HANDLE_ERROR(cudaMemcpy(output, d_Input, arraySize * sizeof(int), cudaMemcpyDeviceToHost));
 
 	printf("Checking results...\n\n");
-	bool validate = true;
+	bool validate = true, iszero = true;
+	
 	for (int i = 1; i < arraySize; i++)
 	{
 		if (output[i - 1] > output[i])
 		{
 			validate = false;
 		}
+		if (output[i] != 0)
+		{
+			iszero = false;
+		}
+	}
+
+	if (iszero)
+	{
+		validate = false;
+		printf("* Result is full of zero!\n* CHECK the GPU part.\n\n");
 	}
 
 	if (validate)
