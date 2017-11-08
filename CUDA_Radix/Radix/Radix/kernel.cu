@@ -180,7 +180,7 @@ int pow(int a, int b)
 	return result;
 }
 
-const int arraySize = 1000000, gridSize = 1024;
+const int arraySize = 500000, gridSize = 1024;
 const int gridCount = ceil((float)arraySize / (float)gridSize);
 int input[arraySize] = { 0 };
 int output[arraySize] = { 0 };
