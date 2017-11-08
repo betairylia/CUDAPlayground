@@ -31,7 +31,7 @@ static void HandleError(cudaError_t err,
 
 //#define CHECK_RESULTS_OUTPUT
 
-__global__ void GenerateHistogramAndPredicate(int *input, int *currentBit, int *numBits, int *bitHistogram, int *predicate, int *size)
+__global__ void GenerateHistogramAndPredicate(int *input, int *currentBit, int *numBits, int *bitHistogram, int *predicate, int *size, int numBitsPow2)
 {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
 	int bid = blockIdx.x;
@@ -41,10 +41,30 @@ __global__ void GenerateHistogramAndPredicate(int *input, int *currentBit, int *
 		return;
 	}
 
+	extern __shared__ int localBin[];
+	if (threadIdx.x == 0)
+	{
+		for(int i = 0; i < numBitsPow2; i++)
+			localBin[i] = 0;
+	}
+	__syncthreads();
+
 	int bit = (input[id] >> (*currentBit)) & ((1 << *numBits) - 1);
 
-	atomicAdd(&(bitHistogram[bit * gridDim.x + blockIdx.x]), 1);
+	//atomicAdd(&(bitHistogram[bit * gridDim.x + blockIdx.x]), 1);
+
+	atomicAdd(&localBin[bit], 1);
+	
 	predicate[bit * (*size) + id] = 1;
+
+	__syncthreads();
+	if (threadIdx.x == 0)
+	{
+		for(int i = 0; i < numBitsPow2; i++)
+			bitHistogram[i * gridDim.x + bid] = localBin[i];
+	}
+
+	__syncthreads();
 }
 
 __global__ void PrefixSum(int *input, int *output, int *size, int *totalBits)
@@ -160,14 +180,14 @@ int pow(int a, int b)
 	return result;
 }
 
-const int arraySize = 500000, gridSize = 1024;
+const int arraySize = 1000000, gridSize = 1024;
 const int gridCount = ceil((float)arraySize / (float)gridSize);
 int input[arraySize] = { 0 };
 int output[arraySize] = { 0 };
 
 int main()
 {
-	const int totalBits = 24, numBits = 1;
+	const int totalBits = 20, numBits = 1;
 	const int numBitsPow2 = pow(2, numBits);
 
 	int sizeBitScan = numBitsPow2 * gridCount;
@@ -253,7 +273,7 @@ int main()
 #endif
 		/////////////////
 
-		GenerateHistogramAndPredicate <<< gridCount, gridSize >>> (d_Input, d_currentBit, d_bitLenth, d_bitHistogram, d_predicate, d_size);
+		GenerateHistogramAndPredicate <<< gridCount, gridSize, numBitsPow2 * sizeof(unsigned int) >>> (d_Input, d_currentBit, d_bitLenth, d_bitHistogram, d_predicate, d_size, numBitsPow2);
 
 #ifdef CHECK_RESULTS_OUTPUT
 		//check results
